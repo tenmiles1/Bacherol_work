@@ -1,109 +1,86 @@
 import os
+import json
 import pickle
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.applications.inception_v3 import InceptionV3, preprocess_input
-from tensorflow.keras.preprocessing import image
+from PIL import Image
 from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.applications.inception_v3 import InceptionV3, preprocess_input
+from model import build_model_with_attention as build_model
 
-from model import build_model
+with open('data/processed/tokenizer.json', 'r', encoding='utf-8') as f:
+    tokenizer_data = json.load(f)
+    wordtoix = tokenizer_data['wordtoix']
+    ixtoword = {int(k): v for k, v in tokenizer_data['ixtoword'].items()}
+vocab_size = len(wordtoix)
 
+with open('data/processed/max_length.pkl', 'rb') as f:
+    max_length = pickle.load(f)
 
-def load_vocab_and_tokenizer():
-    processed_dir = 'data/processed'
-    vocab_path = os.path.join(processed_dir, 'vocab.pkl')
-
-    with open(vocab_path, 'rb') as f:
-        vocab = pickle.load(f)
-
-    vocab_list = sorted(list(vocab))
-    wordtoix = {w: i + 1 for i, w in enumerate(vocab_list)}
-    wordtoix['<pad>'] = 0
-
-    if '<start>' not in wordtoix:
-        wordtoix['<start>'] = len(wordtoix)
-    if '<end>' not in wordtoix:
-        wordtoix['<end>'] = len(wordtoix)
-
-    ixtoword = {v: k for k, v in wordtoix.items()}
-
-    vocab_size = len(wordtoix)
-    return wordtoix, ixtoword, vocab_size
+model = build_model(vocab_size, max_length)
+model.load_weights('data/processed/image_caption_model_best_val_loss.weights (4).h5')
 
 
-def load_max_length():
-    processed_dir = 'data/processed'
-    max_length_path = os.path.join(processed_dir, 'max_length.pkl')
-    with open(max_length_path, 'rb') as f:
-        max_length = pickle.load(f)
-    return max_length
+cnn_model = InceptionV3(weights='imagenet', include_top=False)
+cnn_model.trainable = False
 
 
-def load_trained_model(vocab_size, max_length):
-    processed_dir = 'data/processed'
-    model_path = os.path.join(processed_dir, 'image_caption_model.h5')
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file wasnt found: {model_path}")
-
-    model = build_model(vocab_size=vocab_size, max_length=max_length, embedding_dim=256, units=256)
-    model.load_weights(model_path)
-    return model
-
-
-def get_inception_model():
-    inception = InceptionV3(weights='imagenet', include_top=False, pooling='avg')
-    return inception
-
-
-def extract_features(img_path, inception_model):
-    img = image.load_img(img_path, target_size=(299, 299))
-    x = image.img_to_array(img)
-    x = np.expand_dims(x, axis=0)
+def extract_features(img_path):
+    img = Image.open(img_path).convert('RGB').resize((299, 299))
+    x = np.expand_dims(np.array(img), axis=0)
     x = preprocess_input(x)
-    features = inception_model.predict(x)
-    return features[0]  # (2048,)
+    features = cnn_model.predict(x)
+    return np.reshape(features, (64, 2048))
 
 
-def generate_caption_greedy(model, photo_features, wordtoix, ixtoword, max_length):
-    start_token = wordtoix.get('<start>')
-    end_token = wordtoix.get('<end>')
+def generate_caption_beam(model, image_feature, wordtoix, ixtoword, max_length, beam_size=3):
+    sequences = [[[wordtoix['<start>']], 0.0]]
+    max_loops = min(20, max_length)
 
-    in_text = [start_token]
+    for _ in range(max_loops):
+        all_candidates = []
+        for seq, score in sequences:
+            if seq[-1] == wordtoix['<end>'] and len(seq) > 5:
+                all_candidates.append((seq, score))
+                continue
 
-    for _ in range(max_length):
-        sequence = pad_sequences([in_text], maxlen=max_length, padding='post')
-        yhat = model.predict([sequence, np.array([photo_features])], verbose=0)
-        yhat = np.argmax(yhat)
-        in_text.append(yhat)
+            padded = pad_sequences([seq], maxlen=max_length, padding='post')
+            preds = model([padded, np.array([image_feature])], training=False)[0]
 
-        if yhat == end_token:
+            top_k = np.argsort(preds)[::-1][:beam_size]
+            seen_bigrams = set(zip(seq[:-1], seq[1:]))
+
+            for word in top_k:
+                if len(seq) >= 2 and (seq[-1], word) in seen_bigrams:
+                    continue
+
+                new_seq = seq + [word]
+                new_score = score + np.log(preds[word] + 1e-10) - 0.1 * len(seq)
+                all_candidates.append((new_seq, new_score))
+
+        if not all_candidates:
             break
 
-    caption_words = []
-    for idx in in_text:
-        word = ixtoword.get(idx, '')
-        if word == '<start>' or word == '<pad>':
-            continue
-        if word == '<end>':
-            break
-        caption_words.append(word)
+        sequences = sorted(all_candidates, key=lambda tup: tup[1], reverse=True)[:beam_size]
 
-    final_caption = ' '.join(caption_words)
-    return final_caption
+        if sequences[0][0][-1] == wordtoix['<end>'] and len(sequences[0][0]) > 5:
+            break
+
+    final_seq = sequences[0][0]
+
+    if wordtoix['<end>'] in final_seq:
+        final_seq = final_seq[:final_seq.index(wordtoix['<end>'])]
+
+    caption = [ixtoword.get(idx, '') for idx in final_seq if
+               idx > 0 and ixtoword.get(idx) not in ['<start>', '<end>', '<unk>']]
+    return ' '.join(caption)
 
 
 def main():
-    wordtoix, ixtoword, vocab_size = load_vocab_and_tokenizer()
-    max_length = load_max_length()
-    model = load_trained_model(vocab_size, max_length)
-    model.summary()
-    inception_model = get_inception_model()
-
-    test_image_path = 'data/raw/Flickr8k/Images/216172386_9ac5356dae.jpg'
-    photo_features = extract_features(test_image_path, inception_model)
-    caption = generate_caption_greedy(model, photo_features, wordtoix, ixtoword, max_length)
-    print("Згенерований підпис:", caption)
-    pass
+    img_path = 'data/raw/1-fd02a124.png'
+    features = extract_features(img_path)
+    caption = generate_caption_beam(model, features, wordtoix, ixtoword, max_length, beam_size=3)
+    print("\nPredicted Caption:", caption)
 
 
 if __name__ == '__main__':
